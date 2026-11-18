@@ -27,6 +27,7 @@ library(dplyr)
 library(tidyr)
 library(gt)
 library(lubridate)
+library(purrr)
 
 SITES <- params$SITES
 PATH <- params$DROPBOX
@@ -36,7 +37,7 @@ PLOT_FACTOR_LEVELS <- c("C", "F", "S",                # TMP plots
                         "F1", "F2", "F3", "R1", "R2") # DLG plots
 
 # User can specify groups of synoptic sites: CB or LE
-if(length(SITES == 1)) {
+if(length(SITES) == 1) {
   if(SITES == "CB") {
     SITES <- c("SWH", "GWI", "MSM", "GCW")
   } else if(SITES == "LE") {
@@ -61,6 +62,13 @@ tmp <- WELL_DIMS$Site == "TMP"
 WELL_DIMS$ground_to_sensor_cm[tmp] <- WELL_DIMS$Bolt_to_sensor_depth_cm[tmp] + WELL_DIMS$Bolt_to_ground_cm[tmp]
 
 WELL_DIMS <- WELL_DIMS[c("Site", "Plot", "Instrument_ID", "ground_to_sensor_cm")]
+# DELUGE AquaTROLL 200 wells are listed as DLG / F4 in well_dimensions.csv,
+# but their data arrive as CRC / UP (logger 303): relabel to match the data
+WELL_DIMS <- WELL_DIMS %>%
+  mutate(is_dlg_f4 = Site == "DLG" & Plot == "F4",
+         Site = if_else(is_dlg_f4, "CRC", Site),
+         Plot = if_else(is_dlg_f4, "UP", Plot)) %>%
+  select(-is_dlg_f4)
 
 # Sapflow information. These files are from different places on the
 # Google Drive and need to be munged to the same format
@@ -73,11 +81,17 @@ sf_cb <- read_csv(SF_CB_FILE, col_types = "cccc_cdd__c__")
 SF_LE_FILE <- "ancillary-data/LE_sapflow_inventory - Copy of Sheet1.csv"
 message("Reading ", SF_LE_FILE)
 sf_le <- read_csv(SF_LE_FILE, col_types = "ccdcdcc__")
+# DLG: data Logger column is the PakBus number, not the "DLG_F1" name
+SF_DLG_FILE <- "ancillary-data/DELUGE_SF_Monitoring.csv"
+message("Reading ", SF_DLG_FILE)
+sf_dlg <- read_csv(SF_DLG_FILE, col_types = cols(.default = "c"))
+
 sf_tmp %>%
   mutate(Site = "TMP") %>% 
   select(Site, Logger, Port, Sapflux_ID, Tree_ID) %>% 
   bind_rows(sf_cb %>% select(Site, Logger, Port, Sapflux_ID, Tree_ID)) %>% 
   bind_rows(sf_le %>% select(Site, Logger, Port, Sapflux_ID = Tree_Code, Tree_ID = Tag)) %>% 
+  bind_rows(sf_dlg %>% transmute(Site = "DLG", Logger = PakBus, Port = as.double(Port),Sapflux_ID = Species_Code, Tree_ID)) %>% 
   mutate(Tree = paste0(Sapflux_ID, " (", Tree_ID, ")")) %>% 
   select(-Sapflux_ID, -Tree_ID) ->
   SF_METADATA
@@ -166,7 +180,7 @@ read_files <- function(type, sitelist = SITES, path = PATH) {
     if(site == "DLG") {
       SUBPATH <- "COMPASS_PNNL_Data"
       CURRENT <- "current_data"
-      PATTERN <- paste0(site, "-.*_[0-9]+_", type)
+      PATTERN <- paste0(site, "-.*_[0-9]+_.*", type) # different file names order for stem and soil teros between DLG and CRC UP
     } else if(site %in% c("PTR", "CRC", "OWC", "SWH", "GWI", "MSM", "GCW")) {
       SUBPATH <- "COMPASS_PNNL_Data"
       CURRENT <- "current_data"
@@ -313,58 +327,124 @@ no_data_check(teros, "TEROS")
 ```{r teros-plots}
 #| fig-width: 9
 #| fig-height: 6
-if(nrow(teros) > 0) {
-  teros %>% 
+
+#splitting DELUGE (CRC UP) Teros 21 and stem Teros from the check graphs
+teros_soil <- teros %>% filter(grepl("^TerosTable|^Teros12Table$", Table))
+teros21    <- teros %>% filter(Table == "Teros21Table")
+teros_stem <- teros %>% filter(Table == "Stem_Teros12Table")
+
+# Sensor labels per TEROS type (measurement index -> name)
+# Stem TEROS 12 labels confirmed by the logger programmer (Nov 2026)
+SOIL_LABELS <- c("1" = "VWC", 
+                 "2" = "Temp", 
+                 "3" = "EC")
+T21_LABELS  <- c("1" = "WaterPotential", 
+                 "2" = "Temp")
+STEM_LABELS <- c("1" = "VWC_counts", 
+                 "2" = "Temp", 
+                 "3" = "EC", 
+ # Stem TEROS 12 derived variables (computed in the logger program)
+ # Measurement 4 - bulk dielectric permittivity (eps_b), METER equation,
+ # from calibratedCountsVWC (RAW, measurement 1):
+ # eps_b = (2.887e-9 * RAW^3 - 2.080e-5 * RAW^2 + 5.276e-2 * RAW - 43.39)^2
+                 "4" = "Dielectric", 
+ # Measurement 5 - species-weighted VWC (m3/m3), linear calibration on eps_b:
+ #   VWC_species = m * eps_b + b
+ #
+ #   Species                     m       b       R2
+ #   Acer saccharinum            0.019   0.010   0.849
+ #   Quercus rubra               0.029  -0.115   0.952
+ #   Quercus rubra (shortened)   0.048  -0.060   0.957
+ #
+ # Port -> species, as set in the logger program (m(k), b(k)):
+ #   PB 304/305/307: ports 1-3 Acer saccharinum; 4-6 Quercus rubra (shortened);
+ #                   7-9 Quercus rubra
+ #   PB 303/308:     port 1 Quercus rubra; ports 2-3 Quercus rubra (shortened);
+ #                   port 4 Quercus rubra
+                 "5" = "VWC_species") 
+
+process_teros <- function(df, label, pattern, labels) {
+  if (nrow(df) == 0) return(NULL)
+  
+  long <- df %>%
     pivotstep() %>% 
+    # bind_rows() gives every table the columns of all other tables (filled
+    # with NA), so keep only the columns that belong to this TEROS type
+    filter(grepl(pattern, name)) %>%
     # NA value is -99999.00
-    mutate(value = if_else(value == -9999, NA_real_, value),
-           name = gsub("Teros.+\\(", "", name),
-           name = gsub(")", "", name)) %>% 
-    separate(name, into = c("Port", "sensor"), convert = FALSE) %>% 
-    left_join(TEROS_METADATA, by = c("Site", "Plot", "Logger", "Port")) %>% 
-    #filter(!is.na(ID)) %>% 
-    # the join changes Plot back to character
+    mutate(value = if_else(value %in% c(-9999, -99999), NA_real_, value),
+           # Strip everything up to "(" (handles "Stem_Teros12(" too) and ")"
+           name = gsub("^.*\\(", "", name),
+           name = gsub(")", "", name)) %>%
+    separate(name, into = c("Port", "sensor"), convert = FALSE) %>%
+    # Ports 3 and 4 in W are not installed (constant zeros, no metadata)
+    filter(!(Plot == "W" & Port %in% c("3", "4"))) %>%
+        left_join(TEROS_METADATA, by = c("Site", "Plot", "Logger", "Port")) %>%
+    # The join changes Plot back to character
     mutate(Plot = factor(Plot, levels = PLOT_FACTOR_LEVELS),
            Depth_cm = as.factor(Depth_cm),
-           sensor_name = case_when(
-             sensor == "1" ~ "VWC",
-             sensor == "2" ~ "Temp",
-             sensor == "3" ~ "EC"
-           )) -> 
-    teros_long
+           sensor_name = unname(labels[sensor])) 
+    
+  current <- filter(long, TIMESTAMP >= Sys.time() - days(7),
+                    TIMESTAMP <= Sys.time())
+  if (nrow(current) == 0) {
+    message(label, ": no data in the last 7 days")
+    return(list(long = long, plots = list(), table = NULL))
+  }
   
-teros_long_current <- teros_long %>%
-      filter(
-    TIMESTAMP >= Sys.time() - days(7),
-    TIMESTAMP <= Sys.time()
-  )
+  # TEROS 21 and stem sensors have no depth in the metadata: color by port
+  # Stem sensors are not in TEROS_METADATA (soil depths): always color by port
+  color_var <- if (grepl("Stem", label) || all(is.na(current$Depth_cm))) "Port" else "Depth_cm"
   
-  for(site in unique(teros_long_current$Site)) {
-    teros_site <- filter(teros_long_current, Site == site)
-    p <- ggplot(teros_site, aes(TIMESTAMP, value, color = Depth_cm)) +
+  plots <- map(set_names(unique(current$Site)), function(s) {
+    ggplot(filter(current, Site == s),
+           aes(TIMESTAMP, value, color = .data[[color_var]])) +
       facet_grid(sensor_name ~ Plot, scales = "free") +
       geom_point(na.rm = TRUE) +
       theme(axis.text.x = element_text(angle = 90)) +
-      ggtitle(paste(site, "TEROS"))
-    print(p)
-  }
+      ggtitle(paste(s, label))
+  })
+  
+  # Summary table for the last 7 days
+  table <- current %>%
+    group_by(Site, Plot, sensor_name) %>%
+    summarise(N_sensor = n_distinct(Port),
+              Mean = mean(value, na.rm = TRUE),
+              SD = sd(value, na.rm = TRUE),
+              Range = robust_range(value, 1),
+              N_values = n(),
+              N_na = sum(is.na(value)),
+              .groups = "drop")
+  
+  list(long = long, plots = plots, table = table)
 }
+# Run the same pipeline for the three TEROS types
+res <- pmap(list(
+  df      = list(teros_soil, teros21, teros_stem),
+  label   = c("TEROS 12 soil", "TEROS 21 soil", "Stem TEROS 12"),
+  pattern = c("^Teros[ABC]\\(|^Teros12\\(", "^Teros21\\(", "^Stem_Teros12\\("),
+  labels  = list(SOIL_LABELS, T21_LABELS, STEM_LABELS)
+), process_teros) %>%
+  set_names(c("TEROS 12 soil", "TEROS 21 soil", "Stem TEROS 12"))
+
+# Print plots and summary tables for each type
+# Print plots for each TEROS type (tables are in the teros-table chunk)
+walk(res, ~ if (!is.null(.x)) walk(.x$plots, print))
 ```
 
 ```{r teros-table}
 if(nrow(teros) > 0) {
-    teros_long_current %>% 
-    group_by(Site, Plot, sensor_name) %>% 
-    summarise(N_sensor = length(unique(Port)), 
-              Mean = mean(value, na.rm = TRUE), 
-              SD = sd(value, na.rm = TRUE), 
-              Range = robust_range(value, 1),
-              N_values = n(), 
-              N_na = sum(is.na(value)), 
-              .groups = "drop") %>% 
-    gt(groupname_col = "Site", row_group_as_column = TRUE) %>% 
-    fmt_number(columns = c("Mean", "SD"), decimals = 1) %>% 
-    fmt_number(columns = c("N_sensor", "N_values", "N_na"), decimals = 0, use_seps = TRUE)
+  # One gt summary table per TEROS type, same format as the other sensors
+  res %>%
+    compact() %>%                                  # drop types with no data
+    keep(~ !is.null(.x$table)) %>%
+    imap(~ .x$table %>%
+           gt(groupname_col = "Site", row_group_as_column = TRUE) %>%
+           tab_header(title = .y) %>%
+           fmt_number(columns = c("Mean", "SD"), decimals = 1) %>%
+           fmt_number(columns = c("N_sensor", "N_values", "N_na"),
+                      decimals = 0, use_seps = TRUE)) %>%
+    htmltools::tagList()
 }
 ```
 
@@ -374,66 +454,132 @@ if(nrow(teros) > 0) {
 #| output: "asis"
 troll <- read_files("WaterLevel")
 no_data_check(troll, "AquaTROLL")
+radar <- read_files("Level_Troll")
+no_data_check(radar, "Radar level")
 ```
+
+p \<- ggplot(filter(radar_long_current, name == "Water_above_ground_cm"),
+
+aes(TIMESTAMP, value, color = Plot)) +
+
+geom_line(na.rm = TRUE) +
+
+coord_cartesian(ylim = c(0, 30)) +
+
+labs(y = "Water above ground (cm)", title = "Radar level sensor - water above ground (0-30 cm)") +
+
+theme(axis.text.x = element_text(angle = 90))
+
+print(p)
 
 ```{r troll-plots}
 #| fig-width: 9
-#| fig-height: 4
+#| fig-height: 8
 if(nrow(troll) > 0) {
   troll %>% 
     select(-starts_with("Aquatroll")) %>% # remove text column
     pivotstep() %>% 
-    # NA value is -99999.00
-    mutate(value = if_else(value == -99999, NA_real_, value)) -> 
+    # NA values are -9999 or -99999
+    mutate(value = if_else(value %in% c(-9999, -99999), NA_real_, value)) -> 
     troll_long
-
-# Ugh, of course TMP trolls are totally different. Handle
-if("TMP" %in% troll_long$Site) {
+  
+  # Ugh, of course TMP trolls are totally different. Handle
+  if("TMP" %in% troll_long$Site) {
+    troll_long %>% 
+      filter(Site == "TMP") %>% 
+      # hard coded, crappy, sorry
+      mutate(Instrument_ID = 
+               case_when(Logger == "12" & Table == "WaterLevel200" ~ "683451",
+                         Logger == "13" & Table == "WaterLevel600" ~ "685442",
+                         Logger == "21" & Table == "WaterLevel200" ~ "683416",
+                         Logger == "23" & Table == "WaterLevel200" ~ "683345",
+                         Logger == "23" & Table == "WaterLevel600" ~ "685474",
+                         Logger == "31" & Table == "WaterLevel200" ~ "683408",
+                         Logger == "32" & Table == "WaterLevel600" ~ "685410")) ->
+      troll_long_tmp
+  } else {
+    troll_long_tmp <- NULL
+  }
+  
+  # Radar level sensor: depth to water, signal-to-noise and tilt, one panel per plot
+  if(nrow(radar) > 0) {
+    radar %>%
+      select(-any_of("BattV")) %>%
+      pivotstep() %>%
+      mutate(value = if_else(value %in% c(-9999, -99999), NA_real_, value),
+             Instrument = "Radar level", Instrument_ID = "R") %>%
+      filter(TIMESTAMP >= Sys.time() - days(7),
+             TIMESTAMP <= Sys.time()) ->
+      radar_long_current
+    
+    # Water above ground (cm): radars mounted 150 cm above ground in all DLG plots
+    RADAR_MOUNT_CM <- 150
+    radar_long_current <- bind_rows(
+      radar_long_current,
+      radar_long_current %>%
+        filter(name == "Depth_to_Water_m") %>%
+        mutate(name = "Water_above_ground_cm",
+               value = round(RADAR_MOUNT_CM - value, 1)) # use value * 100 if reported in meters
+    )
+    
+    p <- ggplot(radar_long_current, aes(TIMESTAMP, value)) +
+      facet_grid(name ~ paste(Site, Plot), scales = "free_y") +
+      geom_point(na.rm = TRUE) +
+      ylab(NULL) +
+      ggtitle("Radar level sensor") +
+      theme(axis.text.x = element_text(angle = 90))
+    print(p)
+  }
+  
   troll_long %>% 
-    filter(Site == "TMP") %>% 
-    # hard coded, crappy, sorry
-    mutate(Instrument_ID = 
-             case_when(Logger == "12" & Table == "WaterLevel200" ~ "683451",
-                       Logger == "13" & Table == "WaterLevel600" ~ "685442",
-                       Logger == "21" & Table == "WaterLevel200" ~ "683416",
-                       Logger == "23" & Table == "WaterLevel200" ~ "683345",
-                       Logger == "23" & Table == "WaterLevel600" ~ "685474",
-                       Logger == "31" & Table == "WaterLevel200" ~ "683408",
-                       Logger == "32" & Table == "WaterLevel600" ~ "685410")) ->
-    troll_long_tmp
-} else {
-  troll_long_tmp <- NULL
-}
-
-troll_long %>% 
     filter(Site != "TMP") %>% 
-    mutate(Instrument_ID = substr(Table, nchar(Table), nchar(Table))) %>% 
+    # AquaTROLL 600 tables use the A/B/C suffix of the table name
+    mutate(Instrument_ID = substr(Table, nchar(Table), nchar(Table)),
+    # OWC: the WTE AquaTROLL (A) is wired to the UP logger (323); relabel plot
+           Plot = if_else(Site == "OWC" & Logger == "323" & Instrument_ID == "A",
+                          "WTE", as.character(Plot))) %>% 
+    # AquaTROLL 200: 9 sensor slots with suffix A-I on each variable;
+    # sensor letter position = Instrument_ID in well_dimensions.csv (A=1 ... I=9)
+    mutate(Sensor200 = if_else(Table == "WaterLevel200",
+                               sub(".*_([A-I])$", "\\1", name), NA_character_),
+           Instrument_ID = if_else(Table == "WaterLevel200",
+                                   as.character(match(Sensor200, LETTERS)),
+                                   Instrument_ID)) %>%
+    filter(Table != "WaterLevel200" | !is.na(value)) %>%
     # add TMP data back in
     bind_rows(troll_long_tmp) %>% 
-    # remove "600" with optional A/B/C
-    mutate(name = gsub("[26]00[ABC]?$", "", name)) %>%
+    # label instrument model from the table name (works for TMP too)
+    mutate(Instrument = if_else(grepl("200", Table), 
+                                "AquaTROLL 200", "AquaTROLL 600")) %>%
+    # remove "600" with optional A/B/C, or the "_A".."_I" suffix of AquaTROLL 200
+    mutate(name = gsub("([26]00[ABC]?|_[A-Z])$", "", name)) %>%
     # compute water level
     left_join(WELL_DIMS, by = c("Site", "Plot", "Instrument_ID")) %>% 
     # the join changes Plot back to character
     mutate(Plot = factor(Plot, levels = PLOT_FACTOR_LEVELS)) %>% 
     # filter per SW: WL, temp, salinity, DO, and pH
     filter(name %in% c("Temperature", "Salinity", "RDO_concen",
-                       "pH", "Water_Density", "Pressure")) ->
+                       "pH", "Water_Density", "Pressure", "Depth")) ->
     troll_long
   
   # Compute water level. For each Site, Plot, and Instrument_ID, 
-  # extract the pressure, density, and ground_to_sensor info (happily 
-  # guaranteed to be same order and timestamps since from same instrument)
+  # extract the pressure, density, and ground_to_sensor info
   troll_long %>% 
     filter(name %in% c("Water_Density", "Pressure"), !is.na(value)) %>% 
-    # Sometimes (not totally sure why) there's more than one value per timestep
-    # average those away
+    # Sometimes there's more than one value per timestep; average those away
     group_by(Site, Plot, Logger, Table, TIMESTAMP, name, Instrument_ID, 
              ground_to_sensor_cm) %>%
     summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
-    pivot_wider(names_from = "name") %>% 
+    pivot_wider(names_from = "name") -> wl
+  
+  # Make sure the density column exists even if no instrument reported it
+  if(!"Water_Density" %in% names(wl)) wl$Water_Density <- NA_real_
+  
+  wl %>% 
     # This follows Peter Regier's code, and Fausto M-S's logic
-    mutate(density_gcm3_cor = if_else(Water_Density >= 0.98 & Water_Density <= 1.05, 
+    # Fall back to density = 1 when density is missing or out of range
+    mutate(density_gcm3_cor = if_else(!is.na(Water_Density) &
+                                        Water_Density >= 0.98 & Water_Density <= 1.05, 
                                       Water_Density, 1),
            pressure_mbar = if_else(Pressure == -99999, 0, Pressure),
            pressurehead_m = (pressure_mbar * 100) / (density_gcm3_cor * 1000 * 9.80665),
@@ -441,44 +587,87 @@ troll_long %>%
     select(Site, Plot, Instrument_ID, TIMESTAMP, water_level_cm) -> 
     wl
   
-    # join is many-to-one: many names at a given timestamp
-    troll_long %>% 
-      left_join(wl, by = c("Site", "Plot", "Instrument_ID", "TIMESTAMP"),
-                relationship = "many-to-one") ->
+  # join is many-to-one: many names at a given timestamp
+  troll_long %>% 
+    left_join(wl, by = c("Site", "Plot", "Instrument_ID", "TIMESTAMP"),
+              relationship = "many-to-one") ->
     troll_long
   
-    troll_long_current <- troll_long %>%
-      filter(
-    TIMESTAMP >= Sys.time() - days(7),
-    TIMESTAMP <= Sys.time()
-  )
+  troll_long_current <- troll_long %>%
+    filter(TIMESTAMP >= Sys.time() - days(7),
+           TIMESTAMP <= Sys.time()) %>%
+    # Water level status for coloring; "No well dimensions" when the well is
+    # missing from well_dimensions.csv
+    mutate(WL_status = case_when(is.na(ground_to_sensor_cm) ~ "No well dimensions",
+                                 water_level_cm < -ground_to_sensor_cm ~ "Below sensor",
+                                 TRUE ~ "OK"))
   
-     p <- ggplot(troll_long_current, aes(TIMESTAMP, water_level_cm, color = water_level_cm < -ground_to_sensor_cm)) +
+  WL_COLORS <- c("OK" = "black", "Below sensor" = "red", "No well dimensions" = "grey60")
+  
+  # AquaTROLL 600: one plot per variable
+  x600 <- filter(troll_long_current, Instrument == "AquaTROLL 600")
+  if(nrow(x600) > 0) {
+    p <- ggplot(x600, aes(TIMESTAMP, water_level_cm, color = WL_status)) +
       facet_grid(Site ~ Plot, scales = "free") +
       geom_point(na.rm = TRUE) +
-      scale_color_manual("WL below sensor", values = c("black", "red")) +
-      ggtitle("water_level_cm") +
+      scale_color_manual("WL below sensor", values = WL_COLORS) +
+      ggtitle("AquaTROLL 600 - water_level_cm") +
       theme(axis.text.x = element_text(angle = 90))
     print(p)
     
-  for(nm in unique(troll_long_current$name)) {
-    x <- filter(troll_long_current, name == nm)
-    p <- ggplot(x, aes(TIMESTAMP, value, color = water_level_cm < -ground_to_sensor_cm)) +
-      facet_grid(Site ~ Plot, scales = "free") +
-      ylab(nm) +
-      ggtitle(nm) +
-      scale_color_manual("WL below sensor", values = c("black", "red")) +
+    for(nm in unique(x600$name)) {
+      p <- ggplot(filter(x600, name == nm), aes(TIMESTAMP, value, color = WL_status)) +
+        facet_grid(Site ~ Plot, scales = "free") +
+        ylab(nm) +
+        ggtitle(paste("AquaTROLL 600 -", nm)) +
+        scale_color_manual("WL below sensor", values = WL_COLORS) +
+        geom_point(na.rm = TRUE) +
+        theme(axis.text.x = element_text(angle = 90))
+      print(p)
+    }
+  }
+  
+  # AquaTROLL 200: all variables in a single panel figure, one color per sensor
+  # AquaTROLL 200 has no DO (RDO) or pH sensors: drop them from its panel
+  x200 <- filter(troll_long_current, Instrument == "AquaTROLL 200",
+                 !name %in% c("RDO_concen", "pH"))
+  if(nrow(x200) > 0) {
+    x200_all <- bind_rows(
+      x200,
+      x200 %>% distinct(Site, Plot, Instrument_ID, TIMESTAMP, water_level_cm, WL_status) %>%
+        mutate(name = "water_level_cm", value = water_level_cm)
+    )
+    p <- ggplot(x200_all, aes(TIMESTAMP, value, color = Instrument_ID, shape = WL_status)) +
+      facet_grid(name ~ paste(Site, Plot), scales = "free_y") +
       geom_point(na.rm = TRUE) +
+      scale_shape_manual("WL status",
+                         values = c("OK" = 16, "Below sensor" = 4, "No well dimensions" = 1)) +
+      labs(color = "Sensor (ID)", y = NULL) +
+      ggtitle("AquaTROLL 200") +
       theme(axis.text.x = element_text(angle = 90))
     print(p)
   }
 }
+
+#if we want to see only radar troll
+# Zoom: water above ground, 0-30 cm
+# p <- ggplot(filter(radar_long_current, name == "Water_above_ground_cm"),
+#             aes(TIMESTAMP, value, color = Plot)) +
+#   geom_line(na.rm = TRUE) +
+#   coord_cartesian(ylim = c(0, 30)) +
+#   labs(y = "Water above ground (cm)", title = "Radar level sensor - water above ground (0-30 cm)") +
+#   theme(axis.text.x = element_text(angle = 90))
+# print(p)
 ```
 
 ```{r troll-tables}
-if(nrow(troll) > 0) {
-  troll_long_current %>% 
-    group_by(Site, Plot, name) %>% 
+
+if(nrow(troll) > 0 || nrow(radar) > 0) {
+  bind_rows(if(exists("troll_long_current")) troll_long_current,
+            if(exists("radar_long_current")) radar_long_current) %>%
+    # Keep AquaTROLL 200 without DO/pH (not measured by that model)
+    filter(!(Instrument == "AquaTROLL 200" & name %in% c("RDO_concen", "pH"))) %>%
+    group_by(Site, Instrument, Plot, name) %>% 
     summarise(N_sensor = length(unique(Instrument_ID)), 
               Mean = mean(value, na.rm = TRUE), 
               SD = sd(value, na.rm = TRUE), 
@@ -486,7 +675,10 @@ if(nrow(troll) > 0) {
               N_values = n(), 
               N_na = sum(is.na(value)), 
               .groups = "drop") %>% 
-    gt(groupname_col = "Site", row_group_as_column = TRUE) %>%
+    # One gt row group per site and instrument (e.g. "CRC - AquaTROLL 200")
+    mutate(Group = paste(Site, "-", Instrument)) %>%
+    select(-Site, -Instrument) %>%
+    gt(groupname_col = "Group", row_group_as_column = TRUE) %>%
     fmt_number(columns = c("Mean", "SD"), decimals = 1) %>% 
     fmt_number(columns = c("N_sensor", "N_values", "N_na"), decimals = 0, use_seps = TRUE)
 }
@@ -504,52 +696,68 @@ no_data_check(redox, "Redox")
 #| fig-width: 9
 #| fig-height: 8
 
-#redox colors 
 #redox_colors <- c("darkgoldenrod1", "darkorange", "chocolate4",
  #                 "chartreuse2", "green4", "palegreen2", 
   #                "deepskyblue1", "dodgerblue3", "blue1", 
    #               "darkorchid2", "orchid3", "mediumpurple4")
 
-redox_assignments <- tribble(~number, ~Depth, ~Rep,
-                             1,        10,     1,  
-                             2,        15,     1,    
-                             3,        30,     1,    
-                             4,        45,     1,   
-                             5,        10,     2,   
-                             6,        15,     2,   
-                             7,        30,     2,    
-                             8,        45,     2,     
-                             9,        10,     3,    
-                             10,       15,     3,    
-                             11,       30,     3,    
-                             12,       45,     3)
-
+#Roberta -> fixing differences between DLG and LE redox depth and the CRC-UP F4 troublemaker :(
+# Each probe reads 2 depths; ports 1H-12H wired in order. Only channels 1-12 are wired;
+# 13-24 are unconnected mux channels (floating) when the logger loops to 24.
+redox_assignments <- tribble(~depth_set, ~number, ~Depth, ~Rep, ~Probe,
+                             # LE sites (CRC TR/W, PTR, OWC): probes "10,25" and "30,45"
+                             "LE",   1, 10, 1, "10,25",
+                             "LE",   2, 25, 1, "10,25",
+                             "LE",   3, 30, 1, "30,45",
+                             "LE",   4, 45, 1, "30,45",
+                             "LE",   5, 10, 2, "10,25",
+                             "LE",   6, 25, 2, "10,25",
+                             "LE",   7, 30, 2, "30,45",
+                             "LE",   8, 45, 2, "30,45",
+                             "LE",   9, 10, 3, "10,25",
+                             "LE",  10, 25, 3, "10,25",
+                             "LE",  11, 30, 3, "30,45",
+                             "LE",  12, 45, 3, "30,45",
+                             # DLG sites and CRC UP: probes "10,20" and "30,40"
+                             "DLG",  1, 10, 1, "10,20",
+                             "DLG",  2, 20, 1, "10,20",
+                             "DLG",  3, 30, 1, "30,40",
+                             "DLG",  4, 40, 1, "30,40",
+                             "DLG",  5, 10, 2, "10,20",
+                             "DLG",  6, 20, 2, "10,20",
+                             "DLG",  7, 30, 2, "30,40",
+                             "DLG",  8, 40, 2, "30,40",
+                             "DLG",  9, 10, 3, "10,20",
+                             "DLG", 10, 20, 3, "10,20",
+                             "DLG", 11, 30, 3, "30,40",
+                             "DLG", 12, 40, 3, "30,40")
 
 if(nrow(redox) > 0) {
-  redox %>% 
-    select(-BattV) %>% 
+  redox %>%
+    select(-BattV) %>%
     filter(Table == "Redox15") %>%  # per SJW: only look at 15 minutes data
-    pivotstep() %>% 
-    separate(name, into = c("which", "number"), extra = "drop") %>% 
-    mutate(number = as.numeric(number)) %>% 
-    left_join(redox_assignments, by = "number") %>% 
-    mutate(Depth = as.factor(Depth)) %>%
-    mutate(Depth_Rep = as.factor(paste(Depth, Rep, sep = "-"))) ->
+    pivotstep() %>%
+    separate(name, into = c("which", "number"), extra = "drop") %>%
+    mutate(number = as.numeric(number)) %>%
+    filter(number <= 12) %>%  # 13-24 are unwired mux channels
+    mutate(depth_set = if_else(Site == "DLG" | (Site == "CRC" & Plot == "UP"),
+                               "DLG", "LE")) %>%
+    left_join(redox_assignments, by = c("depth_set", "number")) %>%
+    distinct(Site, Plot, TIMESTAMP, which, number, .keep_all = TRUE) %>%  # drop duplicated rows
+    mutate(Depth = as.factor(Depth),
+           Depth_Rep = as.factor(paste(Depth, Rep, sep = "-"))) ->
     redox_long
   
-redox_long_current <- redox_long %>%
-      filter(
-    TIMESTAMP >= Sys.time() - days(7),
-    TIMESTAMP <= Sys.time()
-  )
-  
+  redox_long_current <- redox_long %>%
+    filter(TIMESTAMP >= Sys.time() - days(7),
+           TIMESTAMP <= Sys.time())
   
   for(site in unique(redox_long_current$Site)) {
     redox_site <- filter(redox_long_current, Site == site)
-    p <- ggplot(redox_site, aes(TIMESTAMP, value, color = Depth_Rep)) +
+    p <- ggplot(redox_site, aes(TIMESTAMP, value, color = Depth, shape = factor(Rep))) +
       facet_grid(which ~ Plot) +
       geom_point(na.rm = TRUE) +
-      #scale_color_manual(values = redox_colors) + 
+      labs(shape = "Rep") +
       theme(axis.text.x = element_text(angle = 90)) +
       ggtitle(paste(site, "Redox"))
     print(p)
@@ -592,7 +800,8 @@ if(nrow(exo) > 0) {
     exo_long
   
 exo_long_current <- exo_long %>%
-      filter(
+   #current no sonde installed at PTR
+      filter(Site != "PTR",
     TIMESTAMP >= Sys.time() - days(7),
     TIMESTAMP <= Sys.time()
   )

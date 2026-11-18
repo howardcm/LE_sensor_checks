@@ -24,5 +24,6 @@ message("All done")
 
 
 #current-data-rbp/LE-20250904 
-#after running LE put it in LE-checks
+#after running LE save it in LE-checks
+#after running DLG save it in DLG-checks
  
