@@ -2,7 +2,7 @@
 author: "COMPASS workflows team"
 params:
   DROPBOX: "C:/Users/rbitten/Dropbox"
-  SITES: "LE"
+  SITES: "DLG"
 date: now
 date-format: "YYYY-MM-DD HH:mm:ssZ"
 execute:
@@ -297,6 +297,7 @@ if(nrow(sf) > 0) {
     print(p)
   }
 }
+
 ```
 
 ```{r sf-table}
@@ -457,20 +458,6 @@ no_data_check(troll, "AquaTROLL")
 radar <- read_files("Level_Troll")
 no_data_check(radar, "Radar level")
 ```
-
-p \<- ggplot(filter(radar_long_current, name == "Water_above_ground_cm"),
-
-aes(TIMESTAMP, value, color = Plot)) +
-
-geom_line(na.rm = TRUE) +
-
-coord_cartesian(ylim = c(0, 30)) +
-
-labs(y = "Water above ground (cm)", title = "Radar level sensor - water above ground (0-30 cm)") +
-
-theme(axis.text.x = element_text(angle = 90))
-
-print(p)
 
 ```{r troll-plots}
 #| fig-width: 9
